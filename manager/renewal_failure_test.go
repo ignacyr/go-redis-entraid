@@ -26,8 +26,8 @@ func (p *failingIdentityProvider) RequestToken(context.Context) (shared.Identity
 }
 
 type renewalListener struct {
-	next   chan struct{}
-	errors atomic.Int32
+	next         chan struct{}
+	failedRounds atomic.Int32
 }
 
 func (l *renewalListener) OnNext(*token.Token) {
@@ -37,7 +37,7 @@ func (l *renewalListener) OnNext(*token.Token) {
 	}
 }
 
-func (l *renewalListener) OnError(error) { l.errors.Add(1) }
+func (l *renewalListener) OnError(error) { l.failedRounds.Add(1) }
 
 func TestRenewalResumesAfterFailedRenewal(t *testing.T) {
 	tests := []struct {
@@ -70,10 +70,10 @@ func TestRenewalResumesAfterFailedRenewal(t *testing.T) {
 
 			select {
 			case <-listener.next:
-				require.EqualValues(t, 2, listener.errors.Load(), "each failed round must be reported")
+				require.EqualValues(t, 2, listener.failedRounds.Load(), "each failed round must be reported")
 				require.GreaterOrEqual(t, idp.calls.Load(), 2+tt.failing)
 			case <-time.After(2 * time.Second):
-				t.Fatalf("renewal did not resume after %d failed rounds", listener.errors.Load())
+				t.Fatalf("renewal did not resume after %d failed rounds", listener.failedRounds.Load())
 			}
 		})
 	}
@@ -98,7 +98,7 @@ func TestGetTokenReturnsCurrentTokenWhileRenewalFails(t *testing.T) {
 		got, err := tm.GetToken(false)
 		require.NoError(t, err)
 		require.Same(t, current, got)
-		require.EqualValues(t, 2, idp.calls.Load(), "the token must still be renewed")
+		require.EqualValues(t, 2, idp.calls.Load(), "a renewal must still be attempted")
 
 		_, err = tm.GetToken(true)
 		require.ErrorContains(t, err, "identity provider unavailable")
@@ -114,6 +114,61 @@ func TestGetTokenReturnsCurrentTokenWhileRenewalFails(t *testing.T) {
 		_, err = tm.GetToken(false)
 		require.ErrorContains(t, err, "identity provider unavailable")
 	})
+}
+
+// gatedIdentityProvider issues a token on the first request. Later requests
+// wait for release and fail.
+type gatedIdentityProvider struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *gatedIdentityProvider) RequestToken(context.Context) (shared.IdentityProviderResponse, error) {
+	if p.calls.Add(1) == 1 {
+		return shared.NewIDPResponse(shared.ResponseTypeRawToken, "token")
+	}
+	select {
+	case p.entered <- struct{}{}:
+	default:
+	}
+	<-p.release
+	return nil, errors.New("identity provider unavailable")
+}
+
+func TestNonForcedCallerSharingFailedForcedRequestGetsCurrentToken(t *testing.T) {
+	idp := &gatedIdentityProvider{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	tokenManager, err := NewTokenManager(idp, TokenManagerOptions{
+		LowerRefreshBound:              time.Hour, // every request is a renewal
+		IdentityProviderResponseParser: lifetimeParser(time.Hour),
+	})
+	require.NoError(t, err)
+	tm := tokenManager.(*entraidTokenManager)
+	current, err := tm.GetToken(false)
+	require.NoError(t, err)
+
+	forced := make(chan error, 1)
+	go func() {
+		_, err := tm.GetTokenWithContext(context.Background(), true)
+		forced <- err
+	}()
+	<-idp.entered
+	type result struct {
+		token *token.Token
+		err   error
+	}
+	joined := make(chan result, 1)
+	go func() {
+		tk, err := tm.GetTokenWithContext(context.Background(), false)
+		joined <- result{tk, err}
+	}()
+	time.Sleep(50 * time.Millisecond) // let the non-forced caller join the forced request
+	close(idp.release)
+
+	require.ErrorContains(t, <-forced, "identity provider unavailable")
+	r := <-joined
+	require.NoError(t, r.err)
+	require.Same(t, current, r.token)
 }
 
 // lifetimeParser returns tokens that expire after lifetime.

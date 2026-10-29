@@ -314,7 +314,8 @@ type RetryOptions struct {
     // Default: 1 second
     InitialDelay time.Duration
 
-    // Optional: Maximum delay between retries
+    // Optional: Maximum delay between retries, and the delay before
+    // a new round of retries after a failed one
     // Default: 10 seconds
     MaxDelay time.Duration
 
