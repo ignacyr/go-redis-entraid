@@ -186,19 +186,16 @@ func (e *entraidTokenManager) getTokenForGeneration(forceRefresh bool, generatio
 		return t, nil
 	}
 
-	// Request a new token from the identity provider
-	idpResult, err := e.idp.RequestToken(ctx)
+	current := t
+	t, err := e.requestToken(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to request token from idp: %w", err)
-	}
-
-	t, err = e.identityProviderResponseParser.ParseResponse(idpResult)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse token: %w", err)
-	}
-
-	if t == nil {
-		return nil, fmt.Errorf("failed to get token: token is nil")
+		// Keep handing out the current token until it expires, so new connections
+		// can authenticate while the identity provider is unavailable. Renewal
+		// requests are forced and still get the error.
+		if !forceRefresh && current != nil && time.Now().Before(current.ExpirationOn()) {
+			return current, nil
+		}
+		return nil, err
 	}
 
 	// Hold the lifecycle read lock through publication so Stop cannot retire
@@ -211,6 +208,24 @@ func (e *entraidTokenManager) getTokenForGeneration(forceRefresh bool, generatio
 	// Store the token
 	e.token = t
 	// Return the token - no need to copy since it's immutable
+	return t, nil
+}
+
+// requestToken requests a new token from the identity provider and parses it.
+func (e *entraidTokenManager) requestToken(ctx context.Context) (*token.Token, error) {
+	idpResult, err := e.idp.RequestToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to request token from idp: %w", err)
+	}
+
+	t, err := e.identityProviderResponseParser.ParseResponse(idpResult)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse token: %w", err)
+	}
+
+	if t == nil {
+		return nil, fmt.Errorf("failed to get token: token is nil")
+	}
 	return t, nil
 }
 
@@ -308,9 +323,14 @@ func (e *entraidTokenManager) StartWithContext(ctx context.Context, listener Tok
 					// check if err is retriable
 					if e.retryOptions.IsRetryable(err) {
 						if i == e.retryOptions.MaxAttempts-1 {
-							// last attempt, call OnError
+							// last attempt, call OnError and start a new round after maxDelay
 							listener.OnError(fmt.Errorf("max attempts reached: %w", err))
-							return
+							select {
+							case <-closed:
+								return
+							case <-time.After(maxDelay):
+							}
+							break
 						}
 
 						// Exponential backoff
@@ -328,9 +348,15 @@ func (e *entraidTokenManager) StartWithContext(ctx context.Context, listener Tok
 							// continue to next attempt
 						}
 					} else {
-						// not retriable
+						// not retriable, but the identity provider may recover:
+						// call OnError and start a new round after maxDelay
 						listener.OnError(err)
-						return
+						select {
+						case <-closed:
+							return
+						case <-time.After(maxDelay):
+						}
+						break
 					}
 				}
 			}

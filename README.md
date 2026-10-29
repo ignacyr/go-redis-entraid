@@ -755,7 +755,7 @@ RetryOptions: manager.RetryOptions{
 ```
 
 ### Q: What happens if token refresh fails?
-A: The library will retry according to the configured `RetryOptions`. If all retries fail, the error will be propagated to the client. You can customize the retry behavior by:
+A: The library will retry according to the configured `RetryOptions`. If all retries fail, or the error is not retryable, the error will be propagated to the client and a new round of retries starts after `MaxDelay`. Until the current token expires, new connections keep authenticating with it. You can customize the retry behavior by:
 1. Setting the maximum number of attempts
 2. Configuring the initial and maximum delay between retries using `time.Duration` values
 3. Setting the backoff multiplier for exponential backoff
